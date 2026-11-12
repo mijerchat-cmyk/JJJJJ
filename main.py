@@ -32,6 +32,7 @@ from app import google_auth
 from app import devices as devices_mod
 from app import relay as relay_mod
 from app import email_auth
+from app import drive_auth
 import re
 try:
     from app import web_assets          # PWA и страницы правил (необязательный файл)
@@ -360,7 +361,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/config":
             self.send_json(200, {"google_client_id": google_auth.client_id(),
                                  "email_login": email_auth.configured(),
-                                 "relay_mode": relay_mod.enabled()})
+                                 "relay_mode": relay_mod.enabled(), "drive_offline": drive_auth.configured()})
             return
 
         # Проверка сервера
@@ -662,6 +663,26 @@ class Handler(BaseHTTPRequestHandler):
                     calls.push(uid, {"type": "sync", "scope": sync[0]})
 
     def _do_post_inner(self):
+
+        # Долгий доступ к Drive: обмен кода/ключа в Google. Сервер ничего не запоминает.
+        if self.path in ("/api/drive/token", "/api/drive/refresh"):
+            data = self.read_json_body() or {}
+            if not drive_auth.configured():
+                self.send_json(501, {"error": "Долгий доступ к Drive не настроен на сервере (GOOGLE_CLIENT_SECRET)"})
+                return
+            user_id, _device = self._device_auth()
+            if not user_id:
+                self.send_json(401, {"error": "Сеанс недействителен", "session_invalid": True})
+                return
+            if self.path == "/api/drive/token":
+                result, error, status = drive_auth.exchange_code(user_id, data.get("code", ""))
+            else:
+                result, error, status = drive_auth.refresh(data.get("refresh_token", ""))
+            if error:
+                self.send_json(status, error if isinstance(error, dict) else {"error": error})
+                return
+            self.send_json(status, result)
+            return
 
         # Вход / регистрация через Google.
         # Без username/имени: вход существующего или ответ needs_registration.
