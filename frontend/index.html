@@ -6897,15 +6897,19 @@ function prepareGoogle(){
   }
   return prep;
 }
+function dbg(s){ drive.dbg = new Date().toLocaleTimeString() + ' ' + s; try{ writeMeta({dbg: drive.dbg}); }catch{} }
 function driveEmailLine(){ const m = readMeta(); return m.email ? '<p class="ob-lead">Google: ' + esc(m.email) + '</p>' : ''; }
 // Ключ продления лежит на устройстве, зашифрованный главным ключом копии. На сервере его нет.
-async function saveRt(){ if(!state.mk || !drive.rt) return; try{ await kvPut('rt', await seal(state.mk, enc.encode(drive.rt), 'rt')); }catch{} }
+async function saveRt(){ if(!state.mk || !drive.rt) return; try{ await kvPut('rt', await seal(state.mk, enc.encode(drive.rt), 'rt')); const back = await kvGet('rt'); dbg('ключ продления сохранён на устройстве: ' + (back ? 'да' : 'НЕТ')); }catch(e){ dbg('ОШИБКА сохранения ключа: ' + (e && e.message)); } }
 async function loadRt(){ drive.rt = null; if(!state.mk) return; try{ const env = await kvGet('rt'); if(env) drive.rt = dec.decode(await open(state.mk, env, 'rt')); }catch{} }
 async function dropRt(){ drive.rt = null; try{ await idb('kv', 'readwrite', st => { st.delete('rt'); }); }catch{} }
 function refreshByRt(){
   if(drive.refreshing) return drive.refreshing;
   drive.refreshing = (async () => {
-    const res = await origFetch(API_BASE + '/api/drive/refresh', {method: 'POST', headers: deviceHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({refresh_token: drive.rt})});
+    let res;
+    try{ res = await origFetch(API_BASE + '/api/drive/refresh', {method: 'POST', headers: deviceHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({refresh_token: drive.rt})}); }
+    catch(e){ dbg('продление: нет связи с сервером'); throw e; }
+    dbg('продление доступа: ответ сервера ' + res.status);
     if(res.status === 400) throw new Error('rt-revoked');
     if(!res.ok) throw new DriveError('auth');
     const d = await res.json();
@@ -6923,11 +6927,13 @@ async function connectOffline(cfg){
     });
     client.requestCode();
   });
-  if(!resp || !resp.code) throw new Error('popup_closed');
+  if(!resp || !resp.code){ dbg('окно Google закрыто без кода'); throw new Error('popup_closed'); }
+  dbg('код от Google получен');
   if(resp.scope && !String(resp.scope).includes('drive.appdata')) throw new Error('no-scope');
   let res;
   try{ res = await origFetch(API_BASE + '/api/drive/token', {method: 'POST', headers: deviceHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({code: resp.code})}); }
   catch{ throw new Error('offline-unavailable'); }
+  dbg('обмен кода на сервере: ответ ' + res.status);
   if([401, 404, 501].includes(res.status)) throw new Error('offline-unavailable');
   if(!res.ok){
     let d = {}; try{ d = await res.json(); }catch{}
@@ -6937,6 +6943,7 @@ async function connectOffline(cfg){
   const d = await res.json();
   if(meta.driveSub && d.sub && meta.driveSub !== d.sub) throw new Error('wrong-account:Подключите тот же Google-аккаунт' + (meta.email ? ': ' + meta.email : ''));
   drive.token = d.access_token; drive.exp = Date.now() + (Number(d.expires_in) || 3600) * 1000; storeToken();
+  dbg('Google выдал ключ продления: ' + (d.refresh_token ? 'ДА' : 'НЕТ'));
   if(d.refresh_token){ drive.rt = d.refresh_token; drive.noRt = false; await saveRt(); } else if(!drive.rt) drive.noRt = true;
   const patch = {}; if(d.email) patch.email = d.email; if(d.sub) patch.driveSub = d.sub;
   writeMeta(patch);
@@ -7235,7 +7242,7 @@ function render(){
       + '<div class="backup-row"><button class="backup-btn" data-act="openForm" data-form="pw">' + esc(t.changePw) + '</button><button class="backup-btn" data-act="openForm" data-form="rec">' + esc(t.newRec) + '</button><button class="backup-btn backup-danger" data-act="remove"' + dis + '>' + esc(t.del) + '</button></div>';
     if(ui.form === 'pw') body += '<h4>' + esc(t.changePw) + '</h4>' + pwField('bk-old', t.oldPw) + pwField('bk-new', t.newPw) + pwField('bk-new2', t.pw2) + '<div class="backup-row"><button class="settings-save" data-act="changePw"' + dis + '>' + esc(t.save) + '</button><button class="backup-btn" data-act="cancelForm">' + esc(t.cancel) + '</button></div>';
     if(ui.form === 'rec') body += '<h4>' + esc(t.newRec) + '</h4><p class="section-note">' + esc(t.newRecHint) + '</p>' + pwField('bk-old', t.oldPw) + '<div class="backup-row"><button class="settings-save" data-act="newRecovery"' + dis + '>' + esc(t.save) + '</button><button class="backup-btn" data-act="cancelForm">' + esc(t.cancel) + '</button></div>';
-    body += '<p class="section-note">' + esc(t.note) + '</p>';
+    body += '<p class="section-note" id="bk-diag">Долгий доступ к Drive: ключ ' + (drive.rt ? 'ЕСТЬ' : 'НЕТ') + '<br>' + esc((drive.dbg || readMeta().dbg || 'пока нет данных — нажмите «Сохранить сейчас»')) + '</p>'; body += '<p class="section-note">' + esc(t.note) + '</p>';
     if(RELAY.on) body += '<p class="section-note" id="bk-relay">' + esc(t.relayOn) + ' ' + esc(t.relayUnsaved) + RELAY.dirtyCount + '</p>';
   }
   box.innerHTML = head + body

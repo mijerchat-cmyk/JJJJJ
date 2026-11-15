@@ -6410,7 +6410,7 @@ function setBusy(btn, busy){
 function openRegistration(auth, suggestedName){
   pendingAuth = auth;
   usernameEl.value = '';
-  displayEl.value = suggestedName || '';
+  displayEl.value = suggestedName || ''; { let note = document.getElementById('reg-email-note'); if(!note){ note = document.createElement('p'); note.id = 'reg-email-note'; note.className = 'auth-subtitle'; authForm.insertBefore(note, authForm.querySelector('.field')); } note.textContent = (auth && auth.email) ? 'Аккаунт будет привязан к: ' + auth.email : ''; }
   document.getElementById('accept-terms').checked = false;
   showAuthStep('register');
   usernameEl.focus();
@@ -6537,7 +6537,7 @@ async function onGoogleCredential(response){
     if(!res.ok) throw new Error(await messageError(res, 'Не удалось войти через Google'));
     const data = await res.json();
     if(data.needs_registration){
-      openRegistration({method:'google', credential: response.credential}, data.suggested_name);
+      openRegistration({method:'google', credential: response.credential, email: data.email}, data.suggested_name);
       return;
     }
     storeDevice(data);
@@ -6856,7 +6856,7 @@ const kvGet = k => idb('kv', 'readonly', st => st.get(k));
 const kvPut = (k, v) => idb('kv', 'readwrite', st => { st.put(v, k); });
 const histPut = (k, v) => idb('history', 'readwrite', st => { st.put(v, k); });
 const histAll = () => idb('history', 'readonly', st => st.getAll());
-function wipeLocal(userId){
+function wipeLocal(userId){ try{ drive.rt = null; drive.token = null; drive.exp = 0; }catch{}
   state.mk = null;
   const uid = userId || (me() || {}).id;
   try{ relayStop(); }catch{}
@@ -6871,8 +6871,8 @@ function metaKey(){ return 'mijer_backup_' + (me() ? me().id : 'none'); }
 function readMeta(){ try{ return JSON.parse(localStorage.getItem(metaKey()) || '{}') || {}; }catch{ return {}; } }
 function writeMeta(patch){ try{ localStorage.setItem(metaKey(), JSON.stringify({...readMeta(), ...patch})); }catch{} }
 function clearMeta(){ try{ localStorage.removeItem(metaKey()); }catch{} }
-async function loadMk(){ try{ state.mk = (await kvGet('mk')) || null; }catch{ state.mk = null; } state.loaded = true; }
-async function saveMk(mkRaw){ state.mk = await importMk(mkRaw); try{ await kvPut('mk', state.mk); }catch{} }
+async function loadMk(){ try{ state.mk = (await kvGet('mk')) || null; }catch{ state.mk = null; } state.loaded = true; await loadRt(); if(drive.rt && !tokenValid()){ try{ await Promise.race([connectDrive(false), new Promise(r => setTimeout(r, 4000))]); }catch{} } }
+async function saveMk(mkRaw){ state.mk = await importMk(mkRaw); try{ await kvPut('mk', state.mk); }catch{} if(drive.rt) await saveRt(); }
 
 // ---------------- Google Drive ----------------
 class DriveError extends Error {}
@@ -6897,11 +6897,52 @@ function prepareGoogle(){
   }
   return prep;
 }
-async function connectDrive(interactive){
-  if(tokenValid()) return drive.token;
-  if(!interactive) throw new DriveError('auth');
-  const cfg = await prepareGoogle();
-  if(!cfg.google_client_id) throw new Error('no-google');
+function driveEmailLine(){ const m = readMeta(); return m.email ? '<p class="ob-lead">Google: ' + esc(m.email) + '</p>' : ''; }
+// Ключ продления лежит на устройстве, зашифрованный главным ключом копии. На сервере его нет.
+async function saveRt(){ if(!state.mk || !drive.rt) return; try{ await kvPut('rt', await seal(state.mk, enc.encode(drive.rt), 'rt')); }catch{} }
+async function loadRt(){ drive.rt = null; if(!state.mk) return; try{ const env = await kvGet('rt'); if(env) drive.rt = dec.decode(await open(state.mk, env, 'rt')); }catch{} }
+async function dropRt(){ drive.rt = null; try{ await idb('kv', 'readwrite', st => { st.delete('rt'); }); }catch{} }
+function refreshByRt(){
+  if(drive.refreshing) return drive.refreshing;
+  drive.refreshing = (async () => {
+    const res = await origFetch(API_BASE + '/api/drive/refresh', {method: 'POST', headers: deviceHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({refresh_token: drive.rt})});
+    if(res.status === 400) throw new Error('rt-revoked');
+    if(!res.ok) throw new DriveError('auth');
+    const d = await res.json();
+    drive.token = d.access_token; drive.exp = Date.now() + (Number(d.expires_in) || 3600) * 1000; storeToken();
+  })().finally(() => { drive.refreshing = null; });
+  return drive.refreshing;
+}
+async function connectOffline(cfg){
+  const meta = readMeta();
+  const resp = await new Promise((resolve, reject) => {
+    const client = google.accounts.oauth2.initCodeClient({
+      client_id: cfg.google_client_id, scope: SCOPES, ux_mode: 'popup', login_hint: meta.email || undefined,
+      callback: r => r && r.error ? reject(new Error(r.error)) : resolve(r),
+      error_callback: e => reject(new Error((e && e.type) || 'popup_closed'))
+    });
+    client.requestCode();
+  });
+  if(!resp || !resp.code) throw new Error('popup_closed');
+  if(resp.scope && !String(resp.scope).includes('drive.appdata')) throw new Error('no-scope');
+  let res;
+  try{ res = await origFetch(API_BASE + '/api/drive/token', {method: 'POST', headers: deviceHeaders({'Content-Type': 'application/json'}), body: JSON.stringify({code: resp.code})}); }
+  catch{ throw new Error('offline-unavailable'); }
+  if([401, 404, 501].includes(res.status)) throw new Error('offline-unavailable');
+  if(!res.ok){
+    let d = {}; try{ d = await res.json(); }catch{}
+    if(d.code === 'wrong-account') throw new Error('wrong-account:' + (d.error || ''));
+    throw new Error(d.error || 'drive-token');
+  }
+  const d = await res.json();
+  if(meta.driveSub && d.sub && meta.driveSub !== d.sub) throw new Error('wrong-account:Подключите тот же Google-аккаунт' + (meta.email ? ': ' + meta.email : ''));
+  drive.token = d.access_token; drive.exp = Date.now() + (Number(d.expires_in) || 3600) * 1000; storeToken();
+  if(d.refresh_token){ drive.rt = d.refresh_token; drive.noRt = false; await saveRt(); } else if(!drive.rt) drive.noRt = true;
+  const patch = {}; if(d.email) patch.email = d.email; if(d.sub) patch.driveSub = d.sub;
+  writeMeta(patch);
+  return drive.token;
+}
+async function connectImplicit(cfg){
   const resp = await new Promise((resolve, reject) => {
     const client = google.accounts.oauth2.initTokenClient({
       client_id: cfg.google_client_id, scope: SCOPES,
@@ -6916,6 +6957,24 @@ async function connectDrive(interactive){
   drive.token = resp.access_token; drive.exp = Date.now() + (Number(resp.expires_in) || 3600) * 1000; storeToken();
   try{ const ui2 = await (await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {headers:{Authorization:'Bearer ' + drive.token}})).json(); if(ui2 && ui2.email) writeMeta({email: ui2.email}); }catch{}
   return drive.token;
+}
+async function connectDrive(interactive){
+  if(tokenValid()) return drive.token;
+  if(drive.rt){
+    try{ await refreshByRt(); return drive.token; }
+    catch(e){
+      if(String(e && e.message) === 'rt-revoked') await dropRt();
+      if(!interactive) throw new DriveError('auth');
+    }
+  }
+  if(!interactive) throw new DriveError('auth');
+  const cfg = await prepareGoogle();
+  if(!cfg.google_client_id) throw new Error('no-google');
+  if(cfg.drive_offline){
+    try{ return await connectOffline(cfg); }
+    catch(e){ if(String(e && e.message) !== 'offline-unavailable') throw e; }
+  }
+  return connectImplicit(cfg);
 }
 async function driveFetch(url, opts){
   const o = opts || {};
@@ -7030,7 +7089,7 @@ async function deleteForAccount(){
 
 // ---------------- действия пользователя ----------------
 function explain(e){
-  const t = T(), m = String(e && e.message || e);
+  const t = T(), m = String(e && e.message || e); if(m.indexOf('wrong-account') === 0) return m.slice(14) || (t.err + m);
   if(m === 'bad-password') return t.wrongPw;
   if(m === 'bad-code') return t.wrongCode;
   if(m === 'auth') return t.expired;
@@ -7171,8 +7230,8 @@ function render(){
       + (m.email ? '<span>' + esc(t.account) + '</span><b>' + esc(m.email) + '</b>' : '')
       + '<span>' + esc(t.last) + '</span><b>' + esc(m.last ? fmtTime(m.last) : t.never) + '</b>'
       + (m.last ? '<span>' + esc(t.chats) + '</span><b>' + esc(m.chats) + '</b><span>' + esc(t.messages) + '</span><b>' + esc(m.msgs) + '</b>' : '') + '</div>'
-      + (tokenValid() ? '' : '<p class="backup-err">' + esc(t.expired) + '</p>')
-      + '<div class="backup-row"><button class="settings-save" data-act="backup"' + dis + '>' + esc(tokenValid() ? t.backupNow : t.reconnectAgain) + '</button><button class="backup-btn" data-act="verify"' + dis + '>' + esc(t.verify) + '</button></div>'
+      + ((tokenValid() || drive.rt) ? '' : '<p class="backup-err">' + esc(t.expired) + '</p>') + ((drive.noRt && !drive.rt) ? '<p class="backup-err">Google не выдал долгий доступ к Drive. Откройте myaccount.google.com/permissions \u2192 Mijer Chat \u2192 \u00abУдалить доступ\u00bb, затем подключите Drive снова.</p>' : '')
+      + '<div class="backup-row"><button class="settings-save" data-act="backup"' + dis + '>' + esc((tokenValid() || drive.rt) ? t.backupNow : t.reconnectAgain) + '</button><button class="backup-btn" data-act="verify"' + dis + '>' + esc(t.verify) + '</button></div>'
       + '<div class="backup-row"><button class="backup-btn" data-act="openForm" data-form="pw">' + esc(t.changePw) + '</button><button class="backup-btn" data-act="openForm" data-form="rec">' + esc(t.newRec) + '</button><button class="backup-btn backup-danger" data-act="remove"' + dis + '>' + esc(t.del) + '</button></div>';
     if(ui.form === 'pw') body += '<h4>' + esc(t.changePw) + '</h4>' + pwField('bk-old', t.oldPw) + pwField('bk-new', t.newPw) + pwField('bk-new2', t.pw2) + '<div class="backup-row"><button class="settings-save" data-act="changePw"' + dis + '>' + esc(t.save) + '</button><button class="backup-btn" data-act="cancelForm">' + esc(t.cancel) + '</button></div>';
     if(ui.form === 'rec') body += '<h4>' + esc(t.newRec) + '</h4><p class="section-note">' + esc(t.newRecHint) + '</p>' + pwField('bk-old', t.oldPw) + '<div class="backup-row"><button class="settings-save" data-act="newRecovery"' + dis + '>' + esc(t.save) + '</button><button class="backup-btn" data-act="cancelForm">' + esc(t.cancel) + '</button></div>';
@@ -7219,7 +7278,7 @@ function obRender(){
       + (ob.useCode ? obField('ob-code', t.codeLabel, ob.codeIn, 'text') : obField('ob-pw', t.pw, ob.pw))
       + '<div class="backup-row"><button class="settings-save" data-ob="unlock"' + dis + '>' + esc(t.unlock) + '</button><button class="backup-btn" data-ob="toggleCode"' + dis + '>' + esc(ob.useCode ? t.usePw : t.useCode) + '</button><button class="backup-btn" data-ob="later"' + dis + '>' + esc(t.obLater) + '</button></div>';
   }else if(ob.step === 'code'){
-    h = '<h3>' + esc(t.obCodeTitle) + '</h3><div class="ob-warn">\u26a0 ' + esc(t.obCodeWarn) + '</div>'
+    h = '<h3>' + esc(t.obCodeTitle) + '</h3>' + driveEmailLine() + '<div class="ob-warn">\u26a0 ' + esc(t.obCodeWarn) + '</div>'
       + obWhy('openCode', t.obWhyCode, t.obWhyCodeText)
       + '<div class="backup-code" id="ob-code-show">' + esc(ob.code) + '</div>'
       + '<div class="backup-row"><button class="backup-btn" data-ob="copy">' + esc(t.recCopy) + '</button></div>'
@@ -7524,7 +7583,7 @@ async function relayFlush(){
   if(!RELAY.on || RELAY.flushing) return;
   const meta = readMeta();
   if(!(meta.enabled && state.mk)) return;
-  if(!tokenValid()){ armSilentRefresh(); return; }
+  if(!tokenValid()){ try{ await connectDrive(false); }catch{ armSilentRefresh(); return; } }
   RELAY.flushing = true;
   try{
     const pendSnap = await rall('pending');
@@ -7779,7 +7838,7 @@ async function relayInit(){
     notifyApp();
     if(!RELAY.pollTimer) RELAY.pollTimer = setInterval(() => relayPull(), POLL_MS);
     window.addEventListener('online', () => { relayPull(); flushOutbox(); });
-    if(readMeta().enabled && state.mk && !RELAY.restoredAt && tokenValid()) relayRestore().then(() => relayPull()).catch(() => {});
+    if(readMeta().enabled && state.mk && !RELAY.restoredAt && (tokenValid() || drive.rt)) relayRestore().then(() => relayPull()).catch(() => {});
     scheduleFlush();
   }finally{ RELAY.starting = false; }
 }
@@ -7814,7 +7873,7 @@ async function afterKeyReady(){
 let autoTimer = null;
 function scheduleAuto(){
   const meta = readMeta();
-  if(!meta.enabled || !state.mk || !tokenValid()) return;
+  if(!meta.enabled || !state.mk) return;
   clearTimeout(autoTimer);
   autoTimer = setTimeout(() => { runBackup({auto: true}).then(render).catch(() => {}); }, AUTO_DELAY_MS);
 }

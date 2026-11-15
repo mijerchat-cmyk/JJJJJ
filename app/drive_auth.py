@@ -42,8 +42,10 @@ def _post(form):
             body = json.loads(exc.read().decode("utf-8"))
         except Exception:  # noqa: BLE001
             body = {}
+        print("[drive] Google ответил", exc.code, body.get("error"), body.get("error_description"), flush=True)
         return body, exc.code
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        print("[drive] нет связи с Google:", type(exc).__name__, flush=True)
         return None, 0
 
 
@@ -105,8 +107,10 @@ def exchange_code(user_id, code):
     sub, email = claims.get("sub"), claims.get("email", "")
     if not sub:
         return None, "Google не вернул данные аккаунта", 400
+    print("[drive] код принят; ключ продления:", "ЕСТЬ" if data.get("refresh_token") else "НЕТ", flush=True)
     problem = _binding_error(user_id, sub, email)
     if problem:
+        print("[drive] другой Google-аккаунт, отказ", flush=True)
         return {"error": problem, "code": "wrong-account"}, None, 403
     result = {"access_token": data["access_token"], "expires_in": data.get("expires_in", 3600),
               "email": email, "sub": sub}
