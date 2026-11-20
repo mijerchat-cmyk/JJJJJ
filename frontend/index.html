@@ -7054,7 +7054,7 @@ function runBackup(opts){
     }
     manifest.updated = now;
     await driveWrite(mname, await encryptJSON(state.mk, manifest, mname), mid);
-    writeMeta({last: now, chats: items.length, msgs: total});
+    writeMeta({last: now, chats: items.length, msgs: total}); if(RELAY.on){ try{ const hh = (await kvGet2('chatHashes')) || {}; for(const it of items){ const k = it.kind + ':' + it.id; if(manifest.chats[k]) hh[k] = manifest.chats[k].hash; } await kvSet2('chatHashes', hh); }catch{} }
     return {chats: items.length, messages: total, uploaded};
   })().finally(() => { running = null; });
   return running;
@@ -7418,7 +7418,7 @@ function chatKeyOf(m, uid){
 function toApi(rec){ const o = {...rec}; delete o.kind; delete o.chat_key; delete o.hidden; delete o.upd; if(!o.reactions) o.reactions = {}; return o; }
 const stamp = rec => { rec.upd = nowIso(); return rec; };
 async function saveRec(rec){ stamp(rec); await rbatch([['msgs', 'put', rec], ['dirty', 'put', {id: rec.id, t: 'msg', at: Date.now()}]]); RELAY.dirtyCount++; }
-async function removeRec(id){ await rbatch([['msgs', 'delete', id], ['dirty', 'put', {id, t: 'del', at: Date.now()}]]); RELAY.dirtyCount++; }
+async function removeRec(id){ await rbatch([['msgs', 'delete', id], ['dirty', 'put', {id, t: 'del', at: Date.now()}]]); RELAY.dirtyCount++; try{ await tombAdd(id); }catch{} }
 
 // ---------- приём сообщений и событий ----------
 async function ingestMessage(m, uid, {sent} = {}){
@@ -7611,7 +7611,7 @@ async function relayFlush(){
     // всё, что было принято ДО начала этой записи, теперь надёжно сохранено
     if(pendSnap.length) await patchPending(pendSnap.map(p => p.id), {durable: true});
     RELAY.dirtyCount = (await rall('dirty')).length;
-    writeMeta({last: nowIso()});
+    writeMeta({last: nowIso()}); await refreshCounts(); if(dirty.length) pokeOthers();
     await sendAcks();
     if(deltas.length >= COMPACT_AFTER) await relayCompact();
   }catch(e){
@@ -7645,7 +7645,7 @@ async function relayRestore(){
   const mname = pre + 'manifest.enc';
   if(byName.has(mname)){
     const manifest = await decryptJSON(state.mk, await driveRead(byName.get(mname)), mname);
-    for(const info of Object.values(manifest.chats || {})){
+    { const hh0 = {}; for(const [k0, i0] of Object.entries(manifest.chats || {})) hh0[k0] = i0.hash; await kvSet2('chatHashes', hh0); await kvSet2('manifestSeen', manifest.updated || ''); } for(const info of Object.values(manifest.chats || {})){
       const id = byName.get(info.file); if(!id) continue;
       const data = await decryptJSON(state.mk, await driveRead(id), info.file);
       for(const m of data.messages || []){
@@ -7824,6 +7824,107 @@ window.fetch = function(input, init){
   return origFetch(input, init);
 };
 
+// ---------- синхронизация устройств одного аккаунта через Drive ----------
+async function tombAdd(id){ const t = (await kvGet2('tomb')) || []; if(t.includes(id)) return; t.push(id); await kvSet2('tomb', t.slice(-3000)); }
+function pokeOthers(){ try{ origFetch(API_BASE + '/api/drive/poke', {method: 'POST', headers: deviceHeaders({'Content-Type': 'application/json'}), body: '{}'}).catch(() => {}); }catch{} }
+async function refreshCounts(){
+  try{
+    const vis = (await rall('msgs')).filter(m => !m.hidden && m.type !== 'call');
+    writeMeta({chats: new Set(vis.map(m => m.chat_key)).size, msgs: vis.length});
+  }catch{}
+}
+async function mergeRecs(list, ackIds, fromChatFile){
+  const tomb = new Set((await kvGet2('tomb')) || []);
+  const ops = []; let n = 0;
+  for(const raw of list){
+    if(!raw || !raw.id || tomb.has(raw.id)) continue;
+    let rec = raw;
+    if(fromChatFile){
+      if(!raw.created_at) continue;
+      rec = {...raw, hidden: false, reactions: raw.reactions || {}, upd: raw.upd || raw.created_at};
+    }
+    if(!rec.chat_key || !rec.kind) continue;
+    const ex = await rget('msgs', rec.id);
+    if(!ex){
+      ops.push(['msgs', 'put', rec]); n++; ackIds.push(rec.id);
+    }else if(!fromChatFile){
+      const out = ((rec.upd || '') > (ex.upd || '')) ? {...rec} : {...ex};
+      out.read_at = ex.read_at || rec.read_at || null;
+      out.played_at = ex.played_at || rec.played_at || null;
+      out.hidden = !!(ex.hidden || rec.hidden);
+      if(JSON.stringify(out) !== JSON.stringify(ex)){ ops.push(['msgs', 'put', out]); n++; }
+    }
+  }
+  for(let i = 0; i < ops.length; i += 100) await rbatch(ops.slice(i, i + 100));
+  return n;
+}
+async function ackSynced(ids){
+  try{
+    for(let i = 0; i < ids.length; i += 400){
+      await relayPost('/api/relay/ack', {ids: ids.slice(i, i + 400), level: 2});
+    }
+  }catch{}
+}
+async function relaySync(){
+  if(!RELAY.on || !RELAY.restoredAt) return;
+  if(RELAY.syncing){ RELAY.syncAgain = true; return; }
+  const meta = readMeta();
+  if(!(meta.enabled && state.mk)) return;
+  RELAY.syncing = true;
+  let changed = 0;
+  try{
+    await connectDrive(false);
+    const pre = prefix(), files = await driveList(), byName = new Map(files.map(f => [f.name, f.id]));
+    const known = new Set((await kvGet2('deltas')) || []);
+    const fresh = files.map(f => f.name).filter(n => n.startsWith(pre + 'd_') && !known.has(n)).sort();
+    const ackIds = [];
+    for(const n of fresh){
+      let d;
+      try{ d = await decryptJSON(state.mk, await driveRead(byName.get(n)), n); }
+      catch(e){ if(e instanceof DriveError) throw e; known.add(n); await kvSet2('deltas', [...known].sort()); continue; }
+      changed += await mergeRecs(d.msgs || [], ackIds, false);
+      for(const id of d.dels || []){
+        if(await rget('msgs', id)){ await rbatch([['msgs', 'delete', id]]); changed++; }
+        await tombAdd(id);
+      }
+      known.add(n); await kvSet2('deltas', [...known].sort());
+    }
+    // другое устройство могло «склеить» мелкие файлы в полную копию — забираем недостающее оттуда
+    const mname = pre + 'manifest.enc';
+    if(byName.has(mname)){
+      const manifest = await decryptJSON(state.mk, await driveRead(byName.get(mname)), mname);
+      const seen = await kvGet2('manifestSeen');
+      if((manifest.updated || '') !== (seen || '')){
+        let hashes = await kvGet2('chatHashes');
+        const baselineOnly = !hashes;       // первый запуск после обновления: просто запоминаем состояние
+        hashes = hashes || {};
+        for(const [key, info] of Object.entries(manifest.chats || {})){
+          if(hashes[key] === info.hash) continue;
+          if(!baselineOnly){
+            const id = byName.get(info.file);
+            if(id){
+              const data = await decryptJSON(state.mk, await driveRead(id), info.file);
+              const list = (data.messages || []).map(m => ({...m, kind: data.kind, chat_key: data.kind + ':' + data.id, space_id: data.kind === 'sp' ? (m.space_id || data.id) : m.space_id}));
+              changed += await mergeRecs(list, ackIds, true);
+            }
+          }
+          hashes[key] = info.hash;
+        }
+        await kvSet2('chatHashes', hashes); await kvSet2('manifestSeen', manifest.updated || '');
+      }
+    }
+    if(ackIds.length) await ackSynced(ackIds);
+    if(changed){ await refreshCounts(); notifyApp(); try{ dbg('синхронизация устройств: обновлено записей ' + changed); }catch{} }
+  }catch(e){
+    RELAY.error = String(e && e.message || e);
+    if(!(e instanceof DriveError)) try{ dbg('синхронизация устройств: ошибка ' + RELAY.error); }catch{}
+  }finally{
+    RELAY.syncing = false;
+    if(RELAY.syncAgain){ RELAY.syncAgain = false; setTimeout(relaySync, 500); }
+  }
+}
+document.addEventListener('visibilitychange', () => { if(!document.hidden) relaySync(); });
+
 // ---------- запуск / остановка ----------
 let relayPrevSync = null;
 async function relayInit(){
@@ -7843,7 +7944,7 @@ async function relayInit(){
     RELAY.on = true;
     await relayPull();
     notifyApp();
-    if(!RELAY.pollTimer) RELAY.pollTimer = setInterval(() => relayPull(), POLL_MS);
+    if(!RELAY.pollTimer) RELAY.pollTimer = setInterval(() => relayPull(), POLL_MS); if(!RELAY.syncTimer) RELAY.syncTimer = setInterval(() => relaySync(), 90000); relaySync();
     window.addEventListener('online', () => { relayPull(); flushOutbox(); });
     if(readMeta().enabled && state.mk && !RELAY.restoredAt && (tokenValid() || drive.rt)) relayRestore().then(() => relayPull()).catch(() => {});
     scheduleFlush();
@@ -7896,7 +7997,7 @@ function init(){
   relayPrevSync = prev;
   window.onServerSync = function(msg){
     // В режиме «труба» новое сообщение — это сигнал забрать его с сервера; интерфейс обновится после забора.
-    if(RELAY.on && msg && msg.scope === 'msg'){ relayPull(); return; }
+    if(msg && msg.scope === 'drive'){ if(RELAY.on) relaySync(); return; } if(RELAY.on && msg && msg.scope === 'msg'){ relayPull(); return; }
     try{ if(prev) prev(msg); }catch(e){ console.error(e); }
     if(msg && msg.scope === 'msg') scheduleAuto();
   };

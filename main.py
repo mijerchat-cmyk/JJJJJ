@@ -664,6 +664,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_post_inner(self):
 
+        # Устройство записало новое в Drive — даём знать остальным устройствам этого аккаунта.
+        if self.path == "/api/drive/poke":
+            user_id, _device = self._device_auth()
+            if not user_id:
+                self.send_json(401, {"error": "Сеанс недействителен", "session_invalid": True})
+                return
+            calls.push(user_id, {"type": "sync", "scope": "drive"})
+            self.send_json(200, {"ok": True})
+            return
+
         # Долгий доступ к Drive: обмен кода/ключа в Google. Сервер ничего не запоминает.
         if self.path in ("/api/drive/token", "/api/drive/refresh"):
             data = self.read_json_body() or {}
