@@ -17,14 +17,15 @@ def _contact():
 
 # ---------------- PWA ----------------
 def manifest():
+    icons = []
+    for size in (192, 512):
+        for purpose in ("any", "maskable"):
+            icons.append({"src": f"/icon-{size}.png", "sizes": f"{size}x{size}", "type": "image/png", "purpose": purpose})
     return json.dumps({
-        "name": APP_NAME, "short_name": "Mijer", "start_url": "/", "scope": "/",
-        "display": "standalone", "background_color": BG, "theme_color": THEME,
+        "id": "/", "name": APP_NAME, "short_name": "Mijer", "start_url": "/", "scope": "/",
+        "display": "standalone", "background_color": BG, "theme_color": THEME, "lang": "ru",
         "description": "Мессенджер: чаты, группы, голосовые и видеозвонки",
-        "icons": [
-            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
-            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
-        ],
+        "icons": icons,
     }, ensure_ascii=False)
 
 

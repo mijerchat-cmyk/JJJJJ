@@ -121,6 +121,17 @@ def _target_devices(conn, kind, row, start):
 def _acks_for(conn, item_id):
     return {r["device_id"]: r["level"] for r in conn.execute("SELECT device_id, level FROM relay_acks WHERE item_id = ?", (item_id,)).fetchall()}
 
+def _acked_enough(targets, acks):
+    """Можно ли удалять с сервера. По умолчанию: у каждого человека хотя бы одно устройство
+    записало данные в Drive (уровень 2). RELAY_WAIT_ALL_DEVICES=on — ждать ВСЕ устройства (как раньше)."""
+    if os.environ.get("RELAY_WAIT_ALL_DEVICES", "").strip().lower() in ("on", "1", "true", "yes"):
+        return all(acks.get(d["id"], 0) >= 2 for d in targets)
+    by_user = {}
+    for d in targets:
+        by_user.setdefault(d["user_id"], []).append(d["id"])
+    return all(any(acks.get(device_id, 0) >= 2 for device_id in ids) for ids in by_user.values())
+
+
 
 # ---------------------------------------------------------------- удаление
 def _delete_message(conn, kind, row):
@@ -137,7 +148,7 @@ def _maybe_prune_message(conn, kind, row, start):
     if not targets:
         return False
     acks = _acks_for(conn, row["id"])
-    if all(acks.get(d["id"], 0) >= 2 for d in targets):
+    if _acked_enough(targets, acks):
         _delete_message(conn, kind, row)
         return True
     return False
@@ -154,7 +165,7 @@ def _maybe_prune_event(conn, ev):
     users = _event_targets(ev)
     devices = [d for d in _devices_of(conn, users) if (d["created_at"] or "") <= ev["created_at"]]
     acks = _acks_for(conn, ev["id"])
-    if all(acks.get(d["id"], 0) >= 2 for d in devices):
+    if _acked_enough(devices, acks):
         conn.execute("DELETE FROM relay_events WHERE id = ?", (ev["id"],))
         conn.execute("DELETE FROM relay_acks WHERE item_id = ?", (ev["id"],))
         return True

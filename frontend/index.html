@@ -2065,7 +2065,7 @@ input[type=checkbox]{accent-color:var(--accent,#3b7ddd);width:18px;height:18px;}
 <label class="perm-row"><span>О новых сообщениях</span><input type="checkbox" id="notif-enabled"></label>
 <label class="perm-row"><span>Звук</span><input type="checkbox" id="notif-sound"></label>
 <h4 style="margin:22px 0 4px">Приложение на телефоне</h4>
-<button class="settings-save" id="install-app-btn" type="button" hidden>Установить приложение</button>
+<button class="settings-save" id="install-app-btn" type="button">Установить приложение</button>
 <p class="section-note" id="install-hint" style="margin:6px 0 0"></p>
 <button class="settings-save" id="admin-open-btn" type="button" hidden style="margin-top:18px">Модерация: жалобы</button>
 <div class="danger-zone"><button class="settings-save" id="delete-account-btn" type="button">Удалить аккаунт</button>
@@ -5833,17 +5833,37 @@ csInput.addEventListener('keydown', e => { if(e.key === 'Enter'){ e.preventDefau
 new MutationObserver(() => { if(!csBox.hidden && csInput.value.trim()){ const keep = chatSearch.idx; const chat = openChats.get(activeChatId); const q = csInput.value.trim().toLowerCase(); chatSearch.hits = chat ? chat.messages.filter(m => m.type === 'text' && (m.text || '').toLowerCase().includes(q)).map(m => m.id) : []; chatSearch.idx = Math.min(keep, chatSearch.hits.length - 1); applySearchMarks(false); } }).observe(convMessages, {childList: true});
 
 let installPrompt = null;
-window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; document.getElementById('install-app-btn').hidden = false; });
-document.getElementById('install-app-btn').addEventListener('click', async () => { if(!installPrompt) return; installPrompt.prompt(); await installPrompt.userChoice.catch(() => {}); installPrompt = null; document.getElementById('install-app-btn').hidden = true; });
-window.addEventListener('appinstalled', () => { document.getElementById('install-app-btn').hidden = true; });
-(() => {
-  const ua = navigator.userAgent, hint = document.getElementById('install-hint');
-  const standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
-  if(standalone) hint.textContent = 'Приложение уже установлено на это устройство ✓';
-  else if(/iPhone|iPad|iPod/.test(ua)) hint.textContent = 'iPhone: в Safari нажмите «Поделиться» → «На экран "Домой"».';
-  else hint.textContent = 'Нажмите кнопку выше или откройте меню браузера (⋮) → «Установить приложение».';
-  if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
-})();
+const installBtn = document.getElementById('install-app-btn');
+const installHint = document.getElementById('install-hint');
+const isStandalone = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+function installSteps(){
+  const ua = navigator.userAgent;
+  if(/iPhone|iPad|iPod/.test(ua)) return 'iPhone: откройте сайт в Safari → «Поделиться» → «На экран "Домой"».';
+  if(/SamsungBrowser/.test(ua)) return 'Samsung Internet: меню ≡ → «Добавить страницу на» → «Главный экран».';
+  if(/Firefox|FxiOS/.test(ua)) return 'Firefox: меню ⋮ → «Установить» (или «Добавить на главный экран»).';
+  if(/OPR|Opera/.test(ua)) return 'Opera: меню ⋮ → «Главный экран» (или «Добавить на главный экран»).';
+  return 'Откройте меню браузера (⋮) → «Установить приложение» или «Добавить на главный экран». Если такого пункта нет — откройте этот сайт в Google Chrome.';
+}
+function updateInstallUi(){
+  if(isStandalone()){ installBtn.hidden = true; installHint.textContent = 'Приложение уже установлено на это устройство ✓'; return; }
+  installBtn.hidden = false;
+  installHint.textContent = installPrompt ? 'Нажмите кнопку — приложение установится на телефон.' : installSteps();
+}
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; updateInstallUi(); });
+window.addEventListener('appinstalled', () => { installPrompt = null; updateInstallUi(); });
+installBtn.addEventListener('click', async () => {
+  if(installPrompt){
+    installPrompt.prompt();
+    await installPrompt.userChoice.catch(() => {});
+    installPrompt = null; updateInstallUi();
+  }else{
+    installHint.textContent = installSteps();
+    installHint.style.fontWeight = '600';
+  }
+});
+updateInstallUi();
+if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+
 
 window.pinnedIds = new Set();
 async function loadPinned(){
